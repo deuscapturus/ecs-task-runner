@@ -8,10 +8,9 @@ import "github.com/aws/aws-sdk-go/aws/session"
 
 //import "github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 import "github.com/aws/aws-sdk-go/aws"
-
-//import "sync"
 import "os"
 import "time"
+import "strings"
 
 type arrayFlags []string
 
@@ -84,6 +83,24 @@ func main() {
 		})
 	}
 
+	if len(containerCommandOverrides) > 0 {
+
+		var containerOverrides []*ecs.ContainerOverride
+		for _, containerOverride := range containerCommandOverrides {
+			containeerOverrideMap := strings.Split(containerOverride, "=")
+			if len(containeerOverrideMap) != 2 {
+				log.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
+			}
+
+			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
+				Name:    &containeerOverrideMap[0],
+				Command: []*string{&containeerOverrideMap[1]},
+			})
+		}
+		taskOverrides := &ecs.TaskOverride{ContainerOverrides: containerOverrides}
+		taskInput.SetOverrides(taskOverrides)
+	}
+
 	runningTasks, err := ecsClient.RunTask(taskInput)
 	if err != nil {
 		log.Fatal(err)
@@ -104,15 +121,17 @@ func main() {
 	TaskSuccess := make(chan bool)
 
 	// Wait for task to stop
-	go func() {
+	go func(TaskError chan<- error, TaskSuccess chan<- bool) {
 
 		err = ecsClient.WaitUntilTasksStopped(describeTaskInput)
 		if err != nil {
 			TaskError <- err
+			return
 		}
 		stoppedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
 		if err != nil {
 			TaskError <- err
+			return
 		}
 
 		for _, task := range stoppedTaskDescription.Tasks {
@@ -120,12 +139,15 @@ func main() {
 				log.Println(container)
 				if container.ExitCode == nil {
 					TaskError <- fmt.Errorf(*container.Reason)
+					return
 				} else if int(*container.ExitCode) != 0 {
 					TaskError <- fmt.Errorf("%q\n%q\n\n%q\n%q", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
+					return
 				}
 			}
 		}
-	}()
+		TaskSuccess <- true
+	}(TaskError, TaskSuccess)
 
 	// Log printing goes here
 	go func() {
