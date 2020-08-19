@@ -29,126 +29,11 @@ func (i *arrayFlags) Set(value string) error {
 	return nil
 }
 
-func main() {
+func printLogOutput(describeTaskInput *ecs.DescribeTasksInput, ecsClient *ecs.ECS, logger *log.Logger, awsRegion *string, taskDefinition *ecs.DescribeTaskDefinitionOutput) {
 
-	myLogger := log.New(os.Stderr, "ecs-task-runner ", 1)
-
-	var containerCommandOverrides arrayFlags
-	var securityGroups arrayFlags
-	var vpcSubnets arrayFlags
-
-	taskDefinitionName := flag.String("task-definition", "", "The task definition family name with or without family version.")
-	ecsCluster := flag.String("cluster", "default", "Name of the ECS cluster to use.")
-	awsRegion := flag.String("region", "us-west-2", "AWS region.")
-	ecsFargate := flag.Bool("fargate", true, "Use AWS ECS fargate.")
-	flag.Var(&containerCommandOverrides, "container", "Override command for a container. May be specified multiple times.  Format: -container 'name=\"echo \\'hello\\'\"'")
-	flag.Var(&securityGroups, "security-group", "A security group to assign the to task. May be specified multiple times.")
-	flag.Var(&vpcSubnets, "subnet", "A VPC subnet for the task.  May be specifid multiple times.")
-	flag.Parse()
-
-	ecsClient := ecs.New(session.New(&aws.Config{
-		Region: aws.String(*awsRegion),
-	}))
-
-	taskDefinitionInput := &ecs.DescribeTaskDefinitionInput{
-		TaskDefinition: aws.String(*taskDefinitionName),
-	}
-	taskDefinition, err := ecsClient.DescribeTaskDefinition(taskDefinitionInput)
-	if err != nil {
-		myLogger.Fatal(err)
-
-	}
-
-	launchType := "FARGATE"
-	if *ecsFargate == false {
-		launchType = "EC2"
-	}
-
-	taskInput := &ecs.RunTaskInput{
-		Cluster:        ecsCluster,
-		TaskDefinition: taskDefinitionName,
-		LaunchType:     aws.String(launchType),
-	}
-	if aws.StringValue(taskDefinition.TaskDefinition.NetworkMode) == "awsvpc" {
-		taskInput.SetNetworkConfiguration(&ecs.NetworkConfiguration{
-			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
-				SecurityGroups: aws.StringSlice([]string(securityGroups)),
-				Subnets:        aws.StringSlice([]string(vpcSubnets)),
-			},
-		})
-	}
-
-	if len(containerCommandOverrides) > 0 {
-
-		var containerOverrides []*ecs.ContainerOverride
-		for _, containerOverride := range containerCommandOverrides {
-			containeerOverrideMap := strings.Split(containerOverride, "=")
-			if len(containeerOverrideMap) != 2 {
-				myLogger.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
-			}
-
-			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
-				Name:    &containeerOverrideMap[0],
-				Command: []*string{&containeerOverrideMap[1]},
-			})
-		}
-		taskOverrides := &ecs.TaskOverride{ContainerOverrides: containerOverrides}
-		taskInput.SetOverrides(taskOverrides)
-	}
-
-	runningTasks, err := ecsClient.RunTask(taskInput)
-	if err != nil {
-		myLogger.Fatal(err)
-	}
-
-	myLogger.Print(runningTasks)
-	var runningTaskArns []string
-	for _, task := range runningTasks.Tasks {
-		runningTaskArns = append(runningTaskArns, *task.TaskArn)
-	}
-
-	describeTaskInput := &ecs.DescribeTasksInput{
-		Cluster: ecsCluster,
-		Tasks:   aws.StringSlice(runningTaskArns),
-	}
-
-	TaskError := make(chan error)
-	TaskSuccess := make(chan bool)
-
-	// Wait for task to stop
-	go func(TaskError chan<- error, TaskSuccess chan<- bool) {
-
-		err = ecsClient.WaitUntilTasksStopped(describeTaskInput)
-		if err != nil {
-			TaskError <- err
-			return
-		}
-		stoppedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
-		if err != nil {
-			TaskError <- err
-			return
-		}
-
-		for _, task := range stoppedTaskDescription.Tasks {
-			for _, container := range task.Containers {
-				if container.ExitCode == nil {
-					TaskError <- fmt.Errorf(*container.Reason)
-					return
-				} else if int(*container.ExitCode) != 0 {
-					TaskError <- fmt.Errorf("%q\n%q\n\n%q\n%q", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
-					return
-				}
-			}
-		}
-		TaskSuccess <- true
-	}(TaskError, TaskSuccess)
-
-	// Log printing goes here
-
-	myLogger.Println("Waiting for task to start")
-	// Placeholder for cloudwatchlogs stream.  TODO
+	logger.Println("Waiting for task to start")
 	ecsClient.WaitUntilTasksRunning(describeTaskInput)
-	myLogger.Println("Task has started")
+	logger.Println("Task has started")
 
 	discardLogger := log.New(ioutil.Discard, "you-cant-see-me", 1)
 	cw := cloudwatch.New(aws.String(""), aws.String(""), awsRegion, discardLogger)
@@ -194,8 +79,125 @@ func main() {
 		}
 	}
 
+}
+
+func main() {
+
+	logger := log.New(os.Stderr, "ecs-task-runner ", 1)
+
+	var containerCommandOverrides arrayFlags
+	var securityGroups arrayFlags
+	var vpcSubnets arrayFlags
+
+	taskDefinitionName := flag.String("task-definition", "", "The task definition family name with or without family version.")
+	ecsCluster := flag.String("cluster", "default", "Name of the ECS cluster to use.")
+	awsRegion := flag.String("region", "us-west-2", "AWS region.")
+	ecsFargate := flag.Bool("fargate", true, "Use AWS ECS fargate.")
+	flag.Var(&containerCommandOverrides, "container", "Override command for a container. May be specified multiple times.  Format: -container 'name=\"echo \\'hello\\'\"'")
+	flag.Var(&securityGroups, "security-group", "A security group to assign the to task. May be specified multiple times.")
+	flag.Var(&vpcSubnets, "subnet", "A VPC subnet for the task.  May be specifid multiple times.")
+	flag.Parse()
+
+	ecsClient := ecs.New(session.New(&aws.Config{
+		Region: aws.String(*awsRegion),
+	}))
+
+	taskDefinitionInput := &ecs.DescribeTaskDefinitionInput{
+		TaskDefinition: aws.String(*taskDefinitionName),
+	}
+	taskDefinition, err := ecsClient.DescribeTaskDefinition(taskDefinitionInput)
+	if err != nil {
+		logger.Fatal(err)
+
+	}
+
+	launchType := "FARGATE"
+	if *ecsFargate == false {
+		launchType = "EC2"
+	}
+
+	taskInput := &ecs.RunTaskInput{
+		Cluster:        ecsCluster,
+		TaskDefinition: taskDefinitionName,
+		LaunchType:     aws.String(launchType),
+	}
+	if aws.StringValue(taskDefinition.TaskDefinition.NetworkMode) == "awsvpc" {
+		taskInput.SetNetworkConfiguration(&ecs.NetworkConfiguration{
+			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
+				SecurityGroups: aws.StringSlice([]string(securityGroups)),
+				Subnets:        aws.StringSlice([]string(vpcSubnets)),
+			},
+		})
+	}
+
+	if len(containerCommandOverrides) > 0 {
+
+		var containerOverrides []*ecs.ContainerOverride
+		for _, containerOverride := range containerCommandOverrides {
+			containerOverrideMap := strings.Split(containerOverride, "=")
+			if len(containerOverrideMap) != 2 {
+				logger.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
+			}
+
+			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
+				Name:    &containerOverrideMap[0],
+				Command: []*string{&containerOverrideMap[1]},
+			})
+		}
+		taskOverrides := &ecs.TaskOverride{ContainerOverrides: containerOverrides}
+		taskInput.SetOverrides(taskOverrides)
+	}
+
+	runningTasks, err := ecsClient.RunTask(taskInput)
+	if err != nil {
+		logger.Fatal(err)
+	}
+
+	logger.Print(runningTasks)
+	var runningTaskArns []string
+	for _, task := range runningTasks.Tasks {
+		runningTaskArns = append(runningTaskArns, *task.TaskArn)
+	}
+
+	describeTaskInput := &ecs.DescribeTasksInput{
+		Cluster: ecsCluster,
+		Tasks:   aws.StringSlice(runningTaskArns),
+	}
+
+	TaskError := make(chan error)
+	TaskSuccess := make(chan bool)
+
+	// Wait for task to stop
+	go func(TaskError chan<- error, TaskSuccess chan<- bool) {
+
+		err = ecsClient.WaitUntilTasksStopped(describeTaskInput)
+		if err != nil {
+			TaskError <- err
+			return
+		}
+		stoppedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
+		if err != nil {
+			TaskError <- err
+			return
+		}
+
+		for _, task := range stoppedTaskDescription.Tasks {
+			for _, container := range task.Containers {
+				if container.ExitCode == nil {
+					TaskError <- fmt.Errorf(*container.Reason)
+					return
+				} else if int(*container.ExitCode) != 0 {
+					TaskError <- fmt.Errorf("%q\n%q\n\n%q\n%q", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
+					return
+				}
+			}
+		}
+		TaskSuccess <- true
+	}(TaskError, TaskSuccess)
+
+	printLogOutput(describeTaskInput, ecsClient, logger, awsRegion, taskDefinition)
 	// Wait for any final logs
-	time.Sleep(1 * time.Second)
+	time.Sleep(3 * time.Second)
 
 	// Wait for signal from TaskSuccess or TaskError channels
 	select {
