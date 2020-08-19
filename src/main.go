@@ -4,15 +4,21 @@ import "flag"
 import "fmt"
 import "log"
 import "github.com/aws/aws-sdk-go/service/ecs"
+import "github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 import "github.com/aws/aws-sdk-go/aws/session"
-
-//import "github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+import "github.com/lucagrulla/cw/cloudwatch"
 import "github.com/aws/aws-sdk-go/aws"
 import "os"
 import "time"
+import "io/ioutil"
 import "strings"
 
 type arrayFlags []string
+
+type logEvent struct {
+	logEvent cloudwatchlogs.FilteredLogEvent
+	logGroup string
+}
 
 func (i *arrayFlags) String() string {
 	return ""
@@ -25,7 +31,7 @@ func (i *arrayFlags) Set(value string) error {
 
 func main() {
 
-	log.SetOutput(os.Stderr)
+	myLogger := log.New(os.Stderr, "ecs-task-runner ", 1)
 
 	var containerCommandOverrides arrayFlags
 	var securityGroups arrayFlags
@@ -49,18 +55,7 @@ func main() {
 	}
 	taskDefinition, err := ecsClient.DescribeTaskDefinition(taskDefinitionInput)
 	if err != nil {
-		log.Fatal(err)
-
-	}
-
-	var logGroups []string
-	for _, container := range taskDefinition.TaskDefinition.ContainerDefinitions {
-		if container.LogConfiguration == nil {
-			continue
-		}
-		if aws.StringValue(container.LogConfiguration.LogDriver) == "awslogs" {
-			logGroups = append(logGroups, *container.LogConfiguration.Options["awslogs-group"])
-		}
+		myLogger.Fatal(err)
 
 	}
 
@@ -89,7 +84,7 @@ func main() {
 		for _, containerOverride := range containerCommandOverrides {
 			containeerOverrideMap := strings.Split(containerOverride, "=")
 			if len(containeerOverrideMap) != 2 {
-				log.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
+				myLogger.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
 			}
 
 			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
@@ -103,10 +98,10 @@ func main() {
 
 	runningTasks, err := ecsClient.RunTask(taskInput)
 	if err != nil {
-		log.Fatal(err)
+		myLogger.Fatal(err)
 	}
 
-	log.Print(runningTasks)
+	myLogger.Print(runningTasks)
 	var runningTaskArns []string
 	for _, task := range runningTasks.Tasks {
 		runningTaskArns = append(runningTaskArns, *task.TaskArn)
@@ -136,7 +131,6 @@ func main() {
 
 		for _, task := range stoppedTaskDescription.Tasks {
 			for _, container := range task.Containers {
-				log.Println(container)
 				if container.ExitCode == nil {
 					TaskError <- fmt.Errorf(*container.Reason)
 					return
@@ -150,16 +144,58 @@ func main() {
 	}(TaskError, TaskSuccess)
 
 	// Log printing goes here
-	go func() {
 
-		log.Println("Waiting for task to start")
-		// Placeholder for cloudwatchlogs stream.  TODO
-		//ecsClient.WaitUntilTasksRunning(describeTaskInput)
-		for i := 1; true; i++ {
-			fmt.Println(i)
-			time.Sleep(time.Second)
+	myLogger.Println("Waiting for task to start")
+	// Placeholder for cloudwatchlogs stream.  TODO
+	ecsClient.WaitUntilTasksRunning(describeTaskInput)
+	myLogger.Println("Task has started")
+
+	discardLogger := log.New(ioutil.Discard, "you-cant-see-me", 1)
+	cw := cloudwatch.New(aws.String(""), aws.String(""), awsRegion, discardLogger)
+
+	startedTaskDescription, _ := ecsClient.DescribeTasks(describeTaskInput)
+	var startTime *time.Time
+
+	for _, containerDefinition := range taskDefinition.TaskDefinition.ContainerDefinitions {
+		if containerDefinition.LogConfiguration == nil {
+			continue
 		}
-	}()
+		if aws.StringValue(containerDefinition.LogConfiguration.LogDriver) == "awslogs" {
+			var logStream string
+			for _, task := range startedTaskDescription.Tasks {
+				startTime = task.StartedAt
+				for _, container := range task.Containers {
+					if *container.Name == *containerDefinition.Name {
+						taskArn := strings.Split(*container.TaskArn, "/")[1]
+						logStream = fmt.Sprintf(
+							"%v/%v/%v",
+							*containerDefinition.LogConfiguration.Options["awslogs-stream-prefix"],
+							*container.Name,
+							taskArn,
+						)
+						break
+					}
+				}
+			}
+			logGroup := *containerDefinition.LogConfiguration.Options["awslogs-group"]
+
+			// beginning of all time
+			// end of all time
+			endTime := time.Unix(1<<63-62135596801, 999999999)
+			trigger := make(chan time.Time, 1)
+
+			trigger <- *startTime
+			go func() {
+				for c := range cw.Tail(&logGroup, &logStream, aws.Bool(true), startTime, &endTime, aws.String(""), aws.String(""), trigger) {
+					fmt.Printf("%v: %v", *c.Timestamp, *c.Message)
+				}
+			}()
+
+		}
+	}
+
+	// Wait for any final logs
+	time.Sleep(1 * time.Second)
 
 	// Wait for signal from TaskSuccess or TaskError channels
 	select {
