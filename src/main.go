@@ -1,17 +1,20 @@
 package main
 
-import "flag"
-import "fmt"
-import "log"
-import "github.com/aws/aws-sdk-go/service/ecs"
-import "github.com/aws/aws-sdk-go/service/cloudwatchlogs"
-import "github.com/aws/aws-sdk-go/aws/session"
-import "github.com/lucagrulla/cw/cloudwatch"
-import "github.com/aws/aws-sdk-go/aws"
-import "os"
-import "time"
-import "io/ioutil"
-import "strings"
+import (
+	"flag"
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"strings"
+	"time"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/session"
+	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
+	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/lucagrulla/cw/cloudwatch"
+)
 
 type arrayFlags []string
 
@@ -29,7 +32,38 @@ func (i *arrayFlags) Set(value string) error {
 	return nil
 }
 
-func printLogOutput(describeTaskInput *ecs.DescribeTasksInput, ecsClient *ecs.ECS, logger *log.Logger, awsRegion *string, taskDefinition *ecs.DescribeTaskDefinitionOutput) {
+func getTaskLog(tasks []*ecs.Task, containerDefinition *ecs.ContainerDefinition) (string, *time.Time) {
+	var (
+		logStream string
+		startTime *time.Time
+	)
+
+	for _, task := range tasks {
+		startTime = task.StartedAt
+		for _, container := range task.Containers {
+			if *container.Name == *containerDefinition.Name {
+				taskArn := strings.Split(*container.TaskArn, "/")[1]
+				logStream = fmt.Sprintf(
+					"%v/%v/%v",
+					*containerDefinition.LogConfiguration.Options["awslogs-stream-prefix"],
+					*container.Name,
+					taskArn,
+				)
+				return logStream, startTime
+			}
+		}
+	}
+
+	return logStream, startTime
+}
+
+func printLogOutput(
+	describeTaskInput *ecs.DescribeTasksInput,
+	ecsClient *ecs.ECS,
+	logger *log.Logger,
+	awsRegion *string,
+	taskDefinition *ecs.DescribeTaskDefinitionOutput,
+) {
 
 	logger.Println("Waiting for task to start")
 	ecsClient.WaitUntilTasksRunning(describeTaskInput)
@@ -47,47 +81,70 @@ func printLogOutput(describeTaskInput *ecs.DescribeTasksInput, ecsClient *ecs.EC
 		}
 		if aws.StringValue(containerDefinition.LogConfiguration.LogDriver) == "awslogs" {
 			var logStream string
-			for _, task := range startedTaskDescription.Tasks {
-				startTime = task.StartedAt
-				for _, container := range task.Containers {
-					if *container.Name == *containerDefinition.Name {
-						taskArn := strings.Split(*container.TaskArn, "/")[1]
-						logStream = fmt.Sprintf(
-							"%v/%v/%v",
-							*containerDefinition.LogConfiguration.Options["awslogs-stream-prefix"],
-							*container.Name,
-							taskArn,
-						)
-						break
-					}
-				}
-			}
+			logStream, startTime = getTaskLog(startedTaskDescription.Tasks, containerDefinition)
 			logGroup := *containerDefinition.LogConfiguration.Options["awslogs-group"]
 
-			// beginning of all time
-			// end of all time
 			endTime := time.Unix(1<<63-62135596801, 999999999)
 			trigger := make(chan time.Time, 1)
 
 			trigger <- *startTime
 			go func() {
-				for c := range cw.Tail(&logGroup, &logStream, aws.Bool(true), startTime, &endTime, aws.String(""), aws.String(""), trigger) {
+				for c := range cw.Tail(
+					&logGroup,
+					&logStream,
+					aws.Bool(true),
+					startTime,
+					&endTime,
+					aws.String(""),
+					aws.String(""),
+					trigger,
+				) {
 					fmt.Printf("%v: %v", *c.Timestamp, *c.Message)
 				}
 			}()
-
 		}
 	}
+}
 
+func waitForTaskStop(
+	ecsClient *ecs.ECS,
+	describeTaskInput *ecs.DescribeTasksInput,
+	taskError chan<- error,
+	taskSuccess chan<- bool,
+) {
+	err := ecsClient.WaitUntilTasksStopped(describeTaskInput)
+	if err != nil {
+		taskError <- err
+		return
+	}
+	stoppedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
+	if err != nil {
+		taskError <- err
+		return
+	}
+
+	for _, task := range stoppedTaskDescription.Tasks {
+		for _, container := range task.Containers {
+			if container.ExitCode == nil {
+				taskError <- fmt.Errorf(*container.Reason)
+				return
+			} else if int(*container.ExitCode) != 0 {
+				taskError <- fmt.Errorf("%v\n%v\n%v\n%v", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
+				return
+			}
+		}
+	}
+	taskSuccess <- true
 }
 
 func main() {
-
 	logger := log.New(os.Stderr, "ecs-task-runner ", 1)
 
-	var containerCommandOverrides arrayFlags
-	var securityGroups arrayFlags
-	var vpcSubnets arrayFlags
+	var (
+		containerCommandOverrides arrayFlags
+		securityGroups            arrayFlags
+		vpcSubnets                arrayFlags
+	)
 
 	taskDefinitionName := flag.String("task-definition", "", "The task definition family name with or without family version.")
 	ecsCluster := flag.String("cluster", "default", "Name of the ECS cluster to use.")
@@ -121,6 +178,7 @@ func main() {
 		TaskDefinition: taskDefinitionName,
 		LaunchType:     aws.String(launchType),
 	}
+
 	if aws.StringValue(taskDefinition.TaskDefinition.NetworkMode) == "awsvpc" {
 		taskInput.SetNetworkConfiguration(&ecs.NetworkConfiguration{
 			AwsvpcConfiguration: &ecs.AwsVpcConfiguration{
@@ -131,7 +189,6 @@ func main() {
 	}
 
 	if len(containerCommandOverrides) > 0 {
-
 		var containerOverrides []*ecs.ContainerOverride
 		for _, containerOverride := range containerCommandOverrides {
 			containerOverrideMap := strings.Split(containerOverride, "=")
@@ -164,49 +221,20 @@ func main() {
 		Tasks:   aws.StringSlice(runningTaskArns),
 	}
 
-	TaskError := make(chan error)
-	TaskSuccess := make(chan bool)
+	taskError := make(chan error)
+	taskSuccess := make(chan bool)
 
-	// Wait for task to stop
-	go func(TaskError chan<- error, TaskSuccess chan<- bool) {
-
-		err = ecsClient.WaitUntilTasksStopped(describeTaskInput)
-		if err != nil {
-			TaskError <- err
-			return
-		}
-		stoppedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
-		if err != nil {
-			TaskError <- err
-			return
-		}
-
-		for _, task := range stoppedTaskDescription.Tasks {
-			for _, container := range task.Containers {
-				if container.ExitCode == nil {
-					TaskError <- fmt.Errorf(*container.Reason)
-					return
-				} else if int(*container.ExitCode) != 0 {
-					TaskError <- fmt.Errorf("%q\n%q\n\n%q\n%q", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
-					return
-				}
-			}
-		}
-		TaskSuccess <- true
-	}(TaskError, TaskSuccess)
+	go waitForTaskStop(ecsClient, describeTaskInput, taskError, taskSuccess)
 
 	printLogOutput(describeTaskInput, ecsClient, logger, awsRegion, taskDefinition)
 	// Wait for any final logs
 	time.Sleep(3 * time.Second)
 
-	// Wait for signal from TaskSuccess or TaskError channels
 	select {
-	case <-TaskSuccess:
+	case <-taskSuccess:
 		log.Println("Task stopped succesffully")
-	case err := <-TaskError:
+	case err := <-taskError:
 		log.Println("Error: ", err)
 		defer os.Exit(1)
 	}
-
-	return
 }
