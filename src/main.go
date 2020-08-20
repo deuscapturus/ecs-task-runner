@@ -39,7 +39,7 @@ func getTaskLog(tasks []*ecs.Task, containerDefinition *ecs.ContainerDefinition)
 	)
 
 	for _, task := range tasks {
-		startTime = task.StartedAt
+		startTime = task.CreatedAt
 		for _, container := range task.Containers {
 			if *container.Name == *containerDefinition.Name {
 				taskArn := strings.Split(*container.TaskArn, "/")[1]
@@ -72,7 +72,10 @@ func printLogOutput(
 	discardLogger := log.New(ioutil.Discard, "you-cant-see-me", 1)
 	cw := cloudwatch.New(aws.String(""), aws.String(""), awsRegion, discardLogger)
 
-	startedTaskDescription, _ := ecsClient.DescribeTasks(describeTaskInput)
+	startedTaskDescription, err := ecsClient.DescribeTasks(describeTaskInput)
+	if err != nil {
+		logger.Fatal(err)
+	}
 	var startTime *time.Time
 
 	for _, containerDefinition := range taskDefinition.TaskDefinition.ContainerDefinitions {
@@ -99,7 +102,7 @@ func printLogOutput(
 					aws.String(""),
 					trigger,
 				) {
-					fmt.Printf("%v: %v", *c.Timestamp, *c.Message)
+					fmt.Printf("%v: %v\n", time.Unix(*c.Timestamp/1000, 0), *c.Message)
 				}
 			}()
 		}
@@ -126,10 +129,16 @@ func waitForTaskStop(
 	for _, task := range stoppedTaskDescription.Tasks {
 		for _, container := range task.Containers {
 			if container.ExitCode == nil {
-				taskError <- fmt.Errorf(*container.Reason)
-				return
+				if container.Reason != nil {
+					taskError <- fmt.Errorf(*container.Reason)
+					return
+				}
+				if task.StoppedReason != nil {
+					taskError <- fmt.Errorf(*task.StoppedReason)
+					return
+				}
 			} else if int(*container.ExitCode) != 0 {
-				taskError <- fmt.Errorf("%v\n%v\n%v\n%v", container.ContainerArn, container.Image, container.LastStatus, *container.Reason)
+				taskError <- fmt.Errorf("Container: %v, Exit Code: %v", *container.Name, *container.ExitCode)
 				return
 			}
 		}
@@ -192,13 +201,14 @@ func main() {
 		var containerOverrides []*ecs.ContainerOverride
 		for _, containerOverride := range containerCommandOverrides {
 			containerOverrideMap := strings.Split(containerOverride, "=")
+			containerOverrideCommand := strings.Split(containerOverrideMap[1], " ")
 			if len(containerOverrideMap) != 2 {
 				logger.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
 			}
 
 			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
 				Name:    &containerOverrideMap[0],
-				Command: []*string{&containerOverrideMap[1]},
+				Command: aws.StringSlice(containerOverrideCommand),
 			})
 		}
 		taskOverrides := &ecs.TaskOverride{ContainerOverrides: containerOverrides}
