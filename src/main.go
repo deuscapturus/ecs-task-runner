@@ -3,17 +3,16 @@ package main
 import (
 	"flag"
 	"fmt"
-	"io/ioutil"
-	"log"
-	"os"
-	"strings"
-	"time"
-
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/session"
 	"github.com/aws/aws-sdk-go/service/cloudwatchlogs"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/lucagrulla/cw/cloudwatch"
+	"io/ioutil"
+	"log"
+	"os"
+	"strings"
+	"time"
 )
 
 type arrayFlags []string
@@ -151,6 +150,7 @@ func main() {
 
 	var (
 		containerCommandOverrides arrayFlags
+		containerEnvOverrides     arrayFlags
 		securityGroups            arrayFlags
 		vpcSubnets                arrayFlags
 	)
@@ -159,7 +159,9 @@ func main() {
 	ecsCluster := flag.String("cluster", "default", "Name of the ECS cluster to use.")
 	awsRegion := flag.String("region", "us-west-2", "AWS region.")
 	ecsFargate := flag.Bool("fargate", true, "Use AWS ECS fargate.")
-	flag.Var(&containerCommandOverrides, "container", "Override command for a container. May be specified multiple times.  Format: -container 'name=\"echo \\'hello\\'\"'")
+	envHost := flag.Bool("env-host", false, "Use all current host environment variables in container.")
+	flag.Var(&containerCommandOverrides, "command", "Override command for a container. May be specified multiple times.  Format: -container='name=\"echo \\'hello\\'\"'")
+	flag.Var(&containerEnvOverrides, "env", "Override environment variables for a container. May be specified multiple times.  Format: -env='NAME=VALUE'")
 	flag.Var(&securityGroups, "security-group", "A security group to assign the to task. May be specified multiple times.")
 	flag.Var(&vpcSubnets, "subnet", "A VPC subnet for the task.  May be specifid multiple times.")
 	flag.Parse()
@@ -197,23 +199,73 @@ func main() {
 		})
 	}
 
+	commmandOverrideMap := make(map[string][]*string)
 	if len(containerCommandOverrides) > 0 {
-		var containerOverrides []*ecs.ContainerOverride
 		for _, containerOverride := range containerCommandOverrides {
-			containerOverrideMap := strings.Split(containerOverride, "=")
-			containerOverrideCommand := strings.Split(containerOverrideMap[1], " ")
-			if len(containerOverrideMap) != 2 {
+			containerOverrideSplit := strings.SplitN(containerOverride, "=", 2)
+			containerOverrideCommand := strings.Split(containerOverrideSplit[1], " ")
+			if len(containerOverrideSplit) != 2 {
 				logger.Fatal(fmt.Errorf("Container override must be in format containerName=Command.  Found %v", containerOverride))
 			}
-
-			containerOverrides = append(containerOverrides, &ecs.ContainerOverride{
-				Name:    &containerOverrideMap[0],
-				Command: aws.StringSlice(containerOverrideCommand),
-			})
+			commmandOverrideMap[containerOverrideSplit[0]] = aws.StringSlice(containerOverrideCommand)
 		}
-		taskOverrides := &ecs.TaskOverride{ContainerOverrides: containerOverrides}
-		taskInput.SetOverrides(taskOverrides)
 	}
+
+	envOverrideMap := make(map[string][]*ecs.KeyValuePair)
+	if len(containerEnvOverrides) > 0 {
+		for _, envOverride := range containerEnvOverrides {
+			envOverrideSplit := strings.SplitN(envOverride, "=", 3)
+			if len(envOverrideSplit) != 3 {
+				logger.Fatal(fmt.Errorf("Environment override must be in format containerName=KEY=VALUE.  Found %v", envOverride))
+			}
+			envValuePair := ecs.KeyValuePair{
+				Name:  &envOverrideSplit[1],
+				Value: &envOverrideSplit[2],
+			}
+			envOverrideMap[envOverrideSplit[0]] = append(envOverrideMap[envOverrideSplit[0]], &envValuePair)
+		}
+	}
+
+	if *envHost == true {
+		// Get all env variables
+		for _, containerDefinition := range taskDefinition.TaskDefinition.ContainerDefinitions {
+			for _, envPair := range os.Environ() {
+				// for each environment variable add to envOverrideMap
+				envSplit := strings.SplitN(envPair, "=", 2)
+				envValuePair := ecs.KeyValuePair{
+					Name:  &envSplit[0],
+					Value: &envSplit[1],
+				}
+				envOverrideMap[*containerDefinition.Name] = append(envOverrideMap[*containerDefinition.Name], &envValuePair)
+			}
+		}
+	}
+
+	var taskOverride ecs.TaskOverride
+
+	// loop over all containers and add a ecs.ContainerOverride.
+	var containerOverrides []*ecs.ContainerOverride
+	for _, containerDefinition := range taskDefinition.TaskDefinition.ContainerDefinitions {
+		var containerOverride ecs.ContainerOverride
+		containerName := *containerDefinition.Name
+		containerOverride.SetName(containerName)
+
+		// Command overrides
+		if command, ok := commmandOverrideMap[containerName]; ok {
+			containerOverride.SetCommand(command)
+		}
+
+		// Environment overrides
+		if env, ok := envOverrideMap[containerName]; ok {
+			containerOverride.SetEnvironment(env)
+		}
+
+		containerOverrides = append(containerOverrides, &containerOverride)
+
+	}
+
+	taskOverride.ContainerOverrides = containerOverrides
+	taskInput.SetOverrides(&taskOverride)
 
 	runningTasks, err := ecsClient.RunTask(taskInput)
 	if err != nil {
