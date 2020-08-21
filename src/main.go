@@ -155,6 +155,25 @@ func main() {
 		vpcSubnets                arrayFlags
 	)
 
+	flag.Usage = func() {
+		fmt.Fprintf(
+			flag.CommandLine.Output(),
+			`Run a AWS ECS task and stream the Cloudwatch logs output
+
+Usage:
+  ecs-task-runner [flags]
+
+Examples:
+  ecs-task-runner -security-group sg-abcabcabcd -subnet subnet-1231231231 -task-definition task-def-name
+  ecs-task-runner -env-host -cluster example -command=container-name='echo hello' -security-group sg-abcabcabcd -subnet subnet-1231231231 -task-definition task-def-name:2
+  ecs-task-runner -env-host -env=container-name=HOME=/root -env=container-name=SHELL=/bin/bash -security-group sg-abcabcabcd -subnet subnet-1231231231 -task-definition task-def-name:2
+
+Flags:
+`,
+		)
+		flag.PrintDefaults()
+	}
+
 	taskDefinitionName := flag.String("task-definition", "", "The task definition family name with or without family version.")
 	ecsCluster := flag.String("cluster", "default", "Name of the ECS cluster to use.")
 	awsRegion := flag.String("region", "us-west-2", "AWS region.")
